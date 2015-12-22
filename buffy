@@ -1,0 +1,1821 @@
+#!/usr/bin/perl 
+
+#
+# Title: buffy.pl
+# Author: Simon Ibsen (simon@engineering.ucsb.edu)
+# Purpose: query bacula catalogues for reports
+#
+#
+
+#######
+# There are two types of query targets:
+# 1. Group (catalogue)
+# 2. Host 
+#
+# Of these there are four types of queries 
+# 1. Report - summary
+# 2. Status - Status on certain date 
+# 3. Expansion - Growth 
+# 4. Files - The basic unit of measurement
+#
+# Essentially the query targets and types have to be built 
+# from the bottom up.  That is to say, the Files queries will
+# be used for Expansion queries, and so on, while the Host 
+# queries will be used for the Group, and so on in the same manner.
+#
+#######
+
+use DBI;
+use Date::Parse;
+use Date::Format;
+
+#######################################################################################
+# START COMMAND OPTION PROCESSING
+#######################################################################################
+
+use Getopt::Long;
+# reference: http://perldoc.perl.org/Getopt/Long.html
+
+use strict;
+
+# Check for options here and exit with usage string if none
+if(defined @ARGV < 1){
+	print "Buffy: a tool for extracting reports from Bacula.\n"; 
+	print "Buffy may not be pretty but buffy will make Bacula talk.\n";
+	print "\nRun \"buffy --help\" for usage\n\n";
+}
+
+# These are our date variables.  An exact date (which is 
+# actually a 24 hour period), a start and end date, which
+# define a time range 
+my ($date, $start_date, $end_date, $sdate_days, $edate_days, $sincefulldate);
+
+# These are the query targets.  You can get info about a
+# group or a specific host
+my ($group, $host);
+
+# These are the status query types (only applies to host query targets)
+my ($failures, $report, $status, $stat_last_full,$stat_list_fulls, $stat_last,$stat_successrate);
+
+# These are the expansion query types.  These measure growth rates based on:
+#       Percent change = ((Vpresent-Vpast)/Vpast*100) / unit of time
+#       http://www.ehow.com/how_4532706_calculate-growth-rate-percent-change.html
+# This will be useful for capacity planning
+my ($expansion, $excount, $exsize);
+
+# These are the file query types (only applies to host query targets).  See usage.
+my ($files, $fcount, $fsize, $faverage_count, $faverage_size, $frank, $frank_count, $frank_size, $fpercent_count,$fpercent_size);
+
+# Print lots of extraneous debug messages, or just help
+my ($DEBUG,$help);
+
+# If we don't want to include fulls in our queries that can be specified
+my ($no_fulls);
+
+# Nagios
+my ($nagios, $nagiosW, $nagiosC);
+
+# The harvesting of options happens here
+GetOptions('debug' => \$DEBUG, 'help' => \$help,'date=s' => \$date, 'sdate=s' => \$start_date, 'edate=s' => \$end_date, 'sdate_days=s' => \$sdate_days, 'edate_days=s' => \$edate_days, 'since_full' => \$sincefulldate,
+	'group=s' => \$group, 'host=s' => \$host,
+	'failures=s' => \$failures, 'report' => \$report, 'status' => \$status, 'stat_last_full' => \$stat_last_full, 'stat_list_fulls' => \$stat_list_fulls,'stat_last' => \$stat_last, 'stat_successrate' => \$stat_successrate,
+	'expansion' => \$expansion, 'excount' => \$excount, 'exsize' => \$exsize,
+	'files' => \$files, 'no_fulls' => \$no_fulls,'fcount' => \$fcount, 'fsize' => \$fsize, 'faverage_count' => \$faverage_count,
+	'faverage_size' => \$faverage_size, 'frank' => \$frank,'frank_count' => \$frank_count, 'frank_size' => \$frank_size,
+	'nagios' => \$nagios, 'nagiosW=s' => \$nagiosW, 'nagiosC=s' => \$nagiosC,
+	'fpercent_count' => \$fpercent_count, 'fpercent_size' => \$fpercent_size);
+
+# Check options here and exit with usage string - define option requirements
+if(defined $help){
+        &print_usage;
+}
+
+#######################################################################################
+# END COMMAND OPTION PROCESSING 
+#######################################################################################
+
+#######################################################################################
+# START INITIALIZING BASIC VARIABLES 
+#######################################################################################
+
+# Default catalogue
+unless(defined $group){
+	$group = "bacula";
+}
+
+# Open single db connection.  This is a readonly backup DB account
+my $dbh = DBI->connect("DBI:mysql:$group", "backup", "supersecret");
+
+my ($epoch_date, $epoch_start_date, $epoch_end_date);
+
+# Convert our passed dates to epoch time
+if (defined $date){
+	$epoch_date = str2time($date);
+}
+
+if (defined $start_date){
+	$epoch_start_date = str2time($start_date);
+}
+
+if (defined $end_date){
+	$epoch_end_date = str2time($end_date);
+}
+
+if (defined $sdate_days){
+	$epoch_start_date = time - ($sdate_days * 86400);
+	$start_date = &mytime($epoch_start_date);
+}
+
+if (defined $edate_days){
+	$epoch_end_date = time - ($edate_days * 86400);
+	$end_date = &mytime($epoch_end_date);
+}
+
+my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst, $midnight); 
+
+# If we have no dates then set the default to be today
+if(not defined $date 
+		and not defined $sincefulldate 
+		and not defined $start_date
+		and not defined $end_date){
+
+		# First let's get our current time
+		($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time);
+
+                # Normalize year and month
+                $year = $year + 1900;
+                $mon = $mon + 1;
+		
+		# Now let's take it back to midnight as we are looking at our current day
+		$midnight = (time) - ($sec + ($min * 60) + ($hour * 3600)); 
+
+		# This is string date
+        	$date = "$mon/$mday/$year";
+	
+		# This is our working epoch_date
+		$epoch_date = $midnight;
+
+}
+
+## DEBUG
+if(defined $DEBUG){
+	print "INIT DEBUG: Exact date: $date\n";
+	print "INIT DEBUG: Start date: $start_date\n";
+	print "INIT DEBUG: End date: $end_date\n";
+}
+## DEBUG
+
+#######################################################################################
+# END INITIALIZING BASIC VARIABLES 
+#######################################################################################
+
+#######################################################################################
+# START GROUP MAIN
+#######################################################################################
+
+# This is a group report
+if(not defined $host and defined $report){
+
+if(defined $DEBUG){
+	print "GROUP MAIN epoch_date: $epoch_date\n";
+	print "GROUP MAIN start_date: $start_date\n";
+	print "GROUP MAIN start_date: $epoch_start_date\n";
+	print "GROUP MAIN end_date: $end_date\n";
+	print "GROUP MAIN end_date: $epoch_end_date\n";
+}
+
+	# Print basic date header
+	&print_date_header($date, undef, $start_date, $end_date);
+
+	print "\n";
+
+	# Get group file size
+	my $group_file_size = &host_generic(undef,"group_total_fsize",$epoch_date,$epoch_start_date,$epoch_end_date,$no_fulls);
+	$group_file_size = &byte_converter($group_file_size);
+	print "Group file size: \t\t\t\t\t$group_file_size\n";
+
+	# Get group file count 
+	my $group_file_count = &host_generic(undef,"group_total_fcount",$epoch_date,$epoch_start_date,$epoch_end_date,$no_fulls);
+	print "Group file count: \t\t\t\t\t$group_file_count\n";
+
+
+	my $failures;
+	my $success;
+	my $day_total;
+	my $day_failure_string;
+	
+	# If report is for a single day, create $day_failure_string
+	if (defined $epoch_date)
+	{
+		$failures = &host_failure_count($epoch_date);
+		$success = &host_success_count($epoch_date);
+		$day_total = $failures + $success;
+		$day_failure_string = "($failures failures out of $day_total hosts)";
+	}
+
+	# Get group success rate
+	my $successRate = sprintf("%.2f", &host_generic(undef, "group_success_rate", $epoch_date,$epoch_start_date, $epoch_end_date, $no_fulls) * 100);
+	print "Group success:\t\t\t\t\t\t$successRate% $day_failure_string\n";
+
+	# If report is not for a single day get growth rates
+	if(not defined $epoch_date)
+	{
+		my $group_count_expansion_rate = &get_host_count_expansion_rate("_ALL_", $epoch_date, $epoch_start_date, $epoch_end_date, $no_fulls);
+		print "File count growth rate (%):\t\t\t\t$group_count_expansion_rate\n";
+
+		my $group_size_expansion_rate = &get_host_size_expansion_rate("_ALL_", $epoch_date, $epoch_start_date, $epoch_end_date, $no_fulls);
+		print "File size growth rate (%):\t\t\t\t$group_size_expansion_rate\n";
+	}
+
+	# Get file count average
+	my $group_fave_count = &host_generic(undef,"group_faverage_count",$epoch_date,$epoch_start_date, $epoch_end_date, $no_fulls);
+	print "Backup file count average (across hosts): \t\t$group_fave_count\n";
+
+	# Get file size average
+	my $group_fave_size = &host_generic(undef,"group_faverage_size",$epoch_date,$epoch_start_date, $epoch_end_date, $no_fulls);
+	$group_fave_size = &byte_converter($group_fave_size);
+	print "Backup file size average (across hosts): \t\t$group_fave_size\n";
+
+	print "\n";
+
+	# Print file size host ranking
+	&print_hosts_FSrank($epoch_date,$epoch_start_date, $epoch_end_date, $no_fulls);
+
+	# Print file count host ranking
+	&print_hosts_FCrank($epoch_date,$epoch_start_date, $epoch_end_date, $no_fulls);
+
+	# Print how long since the last successful backup occurred for each host
+	&print_hosts_since_backups;
+}
+
+# Get group status info, this is really only the success rate
+if(not defined $host and defined $status){
+	my $successRate = sprintf("%.2f", &host_generic(undef, "group_success_rate", $epoch_date,$epoch_start_date, $epoch_end_date, $no_fulls) * 100);
+	print "Group success:\t$successRate%\n";
+	print "Most status listings require a --host argument.  For group status, try --report instead\n";
+}
+# Printing option requirements
+if(not defined $host and defined $stat_last_full){
+	print "Option requires a --host argument\n";
+}
+# Printing option requirements
+if(not defined $host and defined $stat_list_fulls){
+	print "Option requires a --host argument\n";
+}
+# Printing option requirements
+if(not defined $host and defined $stat_last){
+	print "Option requires a --host argument\n";
+}
+# Get group successrate
+if(not defined $host and defined $stat_successrate){
+	my $successRate = sprintf("%.2f", &host_generic(undef, "group_success_rate", $epoch_date,$epoch_start_date, $epoch_end_date, $no_fulls) * 100);
+		
+	# If nagios options are defined out the value in nagios performance data format, else just print
+	if(defined $nagios or defined $nagiosW or defined $nagiosC)
+	{
+		&nagios_output($nagiosW, $nagiosC, "Group Success Rate", "Group_Success_Rate", $successRate);
+	}else{
+		print "Group success:\t$successRate%\n";
+	}
+}
+# List failures for group where $failures is the number of days so that the listing is for failures that occurred longer than 
+# $failures ago
+if(not defined $host and defined $failures){
+	&list_failures($failures);
+}elsif(defined $host and defined $failures){
+	# This is an incorrect usage of the option so print the help
+	&print_usage;
+}
+# Get group growth rates
+if(not defined $host and defined $expansion){
+	# If only specifying single date print proper usage
+        if(defined $epoch_date)
+        {
+		print "To get valid growth stats, pick a start to the range (--sdate) in the past, not a single day\n";
+		exit;
+	}
+	my $group_count_expansion_rate = &get_host_count_expansion_rate("_ALL_", $epoch_date, $epoch_start_date, $epoch_end_date, $no_fulls);
+	print "Group File count growth rate (%):\t\t$group_count_expansion_rate\n";
+
+	my $group_size_expansion_rate = &get_host_size_expansion_rate("_ALL_", $epoch_date, $epoch_start_date, $epoch_end_date, $no_fulls);
+	print "Group File size growth rate (%):\t\t$group_size_expansion_rate\n";
+}
+
+# Get only group file count growth rate
+if(not defined $host and defined $excount){
+        if(defined $epoch_date)
+        {
+		print "To get valid growth stats, pick a start to the range (--sdate) in the past, not a single day\n";
+		exit;
+	}
+	my $group_count_expansion_rate = &get_host_count_expansion_rate("_ALL_", $epoch_date, $epoch_start_date, $epoch_end_date, $no_fulls);
+	if(defined $nagios or defined $nagiosW or defined $nagiosC)
+        {
+                &nagios_output($nagiosW, $nagiosC, "Group File Count Growth Rate", "Group_File_Count_Growth_Rate", $group_count_expansion_rate);
+        }
+	else
+	{
+		print "File count growth rate (%):\t\t$group_count_expansion_rate\n";
+	}
+}
+
+# Get only group file size growth rate
+if(not defined $host and defined $exsize){
+        if(defined $epoch_date)
+        {
+		print "To get valid growth stats, pick a start to the range (--sdate) in the past, not a single day\n";
+		exit;
+	}
+	my $group_size_expansion_rate = &get_host_size_expansion_rate("_ALL_", $epoch_date, $epoch_start_date, $epoch_end_date, $no_fulls);
+	if(defined $nagios or defined $nagiosW or defined $nagiosC)
+        {
+                &nagios_output($nagiosW, $nagiosC, "Group File Size Growth Rate", "Group_File_Size_Growth_Rate", $group_size_expansion_rate);
+        }
+	else
+	{
+		print "File size growth rate (%):\t\t$group_size_expansion_rate\n";
+	}
+}
+
+# Get group file count
+if(not defined $host and defined $fcount){
+	my $group_file_count = &host_generic(undef,"group_total_fcount",$epoch_date,$epoch_start_date,$epoch_end_date,$no_fulls);
+	if(defined $nagios or defined $nagiosW or defined $nagiosC)
+	{
+		&nagios_output($nagiosW, $nagiosC, "Group File Count", "Group_File_Count", $group_file_count);
+	}
+	else
+	{
+        	print "Group file count: \t\t\t\t\t$group_file_count\n";
+	}
+}
+
+# Get group file size
+if(not defined $host and defined $fsize){
+	my $group_file_size = sprintf("%.2f", &host_generic(undef,"group_total_fsize",$epoch_date,$epoch_start_date,$epoch_end_date,$no_fulls) / 1073741824);
+	if(defined $nagios or defined $nagiosW or defined $nagiosC)
+	{
+		&nagios_output($nagiosW, $nagiosC, "Group File Size (GB)", "Group_File_Size_GB", $group_file_size);
+	}
+	else
+	{
+        	print "Group file size: \t\t\t\t\t$group_file_size GB\n";
+	}
+}
+
+# Get all file related stats for the group
+if(not defined $host and defined $files){
+
+	my $group_file_size = &host_generic(undef,"group_total_fsize",$epoch_date,$epoch_start_date,$epoch_end_date,$no_fulls);
+	$group_file_size = &byte_converter($group_file_size);
+	print "Group file size: \t\t\t\t\t$group_file_size\n";
+
+	my $group_file_count = &host_generic(undef,"group_total_fcount",$epoch_date,$epoch_start_date,$epoch_end_date,$no_fulls);
+	print "Group file count: \t\t\t\t\t$group_file_count\n";
+
+	my $group_fave_count = &host_generic(undef,"group_faverage_count",$epoch_date,$epoch_start_date, $epoch_end_date, $no_fulls);
+        print "Backup file count average (across hosts): \t\t$group_fave_count\n";
+
+	my $group_fave_size = &host_generic(undef,"group_faverage_size",$epoch_date,$epoch_start_date, $epoch_end_date, $no_fulls);
+        $group_fave_size = &byte_converter($group_fave_size);
+        print "Backup file size average (across hosts): \t\t$group_fave_size\n";
+
+}
+
+#######################################################################################
+# END GROUP MAIN
+#######################################################################################
+
+
+#######################################################################################
+# START HOST MAIN
+#######################################################################################
+
+if (defined $host){
+
+	# This query is for a host
+
+	# Let's get when we last had our last full backup as this value is for other calculations
+	my $epoch_lastfulldate = &host_lastfull($host);
+		
+	# If we are doing this using the --since_full option then assign our start date to our last full date
+	if($sincefulldate eq "1"){$epoch_start_date = $epoch_lastfulldate}
+	
+	## DEBUG 
+ 	if(defined $DEBUG){
+		my $string_lastfulldate = time2str("%a %b %e %T %Y",$epoch_lastfulldate);
+		print "HOST MAIN DEBUG: Last full epoch: $epoch_lastfulldate ($string_lastfulldate)\n";
+	}
+	## DEBUG 
+
+	# If --expansion option was provided
+	if(defined $expansion){
+		my $host_count_expansion_rate = &get_host_count_expansion_rate($host, $epoch_date, $epoch_start_date, $epoch_end_date, $no_fulls);
+                print "File count growth rate (%):\t\t\t\t$host_count_expansion_rate\n";
+		my $host_size_expansion_rate = &get_host_size_expansion_rate($host, $epoch_date, $epoch_start_date, $epoch_end_date, $no_fulls);
+                print "File size growth rate (%):\t\t\t\t$host_size_expansion_rate\n";
+	}
+	# If --excount option was provided
+	if(defined $excount){
+		my $host_count_expansion_rate = &get_host_count_expansion_rate($host, $epoch_date, $epoch_start_date, $epoch_end_date, $no_fulls);
+                print "File count growth rate (%):\t\t\t\t$host_count_expansion_rate\n";
+	}
+	# If --exsize option was provided
+	if(defined $exsize){
+		my $host_size_expansion_rate = &get_host_size_expansion_rate($host, $epoch_date, $epoch_start_date, $epoch_end_date, $no_fulls);
+                print "File size growth rate (%):\t\t\t\t$host_size_expansion_rate\n";
+	}
+
+	# If --files was provided give all of the file stats for this hosts and time range
+	if(defined $files)
+	{
+		&report_files($host,$epoch_date, $epoch_start_date, $epoch_end_date, $no_fulls);
+	}
+
+	# Start processing individual arguments if given (and if the inclusive --files is not provided)
+
+	# File count
+	if(defined $fcount and not defined($files)){
+		my $F_count = &host_generic($host,"fcount",$epoch_date,$epoch_start_date, $epoch_end_date, $no_fulls);
+                print "Total File count:\t\t\t\t$F_count files\n";
+	}
+
+	# File size
+	if(defined $fsize and not defined($files)){
+		my $F_size = &host_generic($host,"fsize",$epoch_date,$epoch_start_date,$epoch_end_date,$no_fulls);
+		$F_size = &byte_converter($F_size);
+                print "Total File size:\t\t\t\t$F_size\n";
+	}
+	
+	# File average count
+	if(defined $faverage_count and not defined($files)){
+		if (defined $epoch_date)
+		{
+			print "To get valid average stats, pick a start to the range (--sdate) in the past, not a single day\n";
+			exit;
+		}
+		my $Fave_count = &host_generic($host, "faverage_count",$epoch_date,$epoch_start_date, $epoch_end_date, $no_fulls);
+                print "Average backup file count:\t\t$Fave_count files\n";
+	}
+
+	# File average size
+	if(defined $faverage_size and not defined($files)){
+		if (defined $epoch_date)
+		{
+			print "To get valid average stats, pick a start to the range (--sdate) in the past, not a single day\n";
+			exit;
+		}
+		my $Fave_size = &host_generic($host, "faverage_size", $epoch_date,$epoch_start_date, $epoch_end_date, $no_fulls);
+		$Fave_size = &byte_converter($Fave_size);
+                print "Average backup file size:\t\t$Fave_size\n";
+	}
+
+
+	# File size and count rank amongst @hosts
+	if(defined $frank and not defined($files)){
+		my @hosts = &list_hosts();
+		my $FCrank = &host_frank_count($host, \@hosts,$epoch_date,$epoch_start_date, $epoch_end_date, $no_fulls);	
+		my $FSrank = &host_frank_size($host, \@hosts, $epoch_date,$epoch_start_date, $epoch_end_date, $no_fulls);
+                print "File count rank:\t\t\t$FCrank out of ".scalar(@hosts)." hosts\n";
+                print "File size rank:\t\t\t\t$FSrank out of ".scalar(@hosts)." hosts\n";
+	}
+	# File count rank amongst @hosts
+	if(defined $frank_count and not defined($files)){
+		my @hosts = &list_hosts();
+		my $FCrank = &host_frank_count($host, \@hosts, $epoch_date,$epoch_start_date, $epoch_end_date, $no_fulls);
+                print "File count rank:\t\t\t$FCrank out of ".scalar(@hosts)." hosts\n";
+	}
+	# File size rank amongst @hosts
+	if(defined $frank_size and not defined($files)){
+		my @hosts = &list_hosts();
+		my $FSrank = &host_frank_size($host, \@hosts, $epoch_date,$epoch_start_date, $epoch_end_date, $no_fulls);
+                print "File size rank:\t\t\t\t$FSrank out of ".scalar(@hosts)." hosts\n";
+	}
+	# File count percentage amongst group
+	if(defined $fpercent_count and not defined($files)){
+		my $countPercentage = &host_fpercent_count($host,$epoch_date,$epoch_start_date, $epoch_end_date, $no_fulls);
+                print "File count usage:\t\t\t$countPercentage\% of group total\n";
+	}
+	# File size percentage amongst group
+	if(defined $fpercent_size and not defined($files)){
+		my $sizePercentage = &host_fpercent_size($host,$epoch_date,$epoch_start_date, $epoch_end_date, $no_fulls);
+                print "File size usage:\t\t\t$sizePercentage\% of group total\n";
+	}
+
+	
+	# Getting data from our last full
+	if(defined $status)
+	{
+		print "Data for last successful backup:\n";
+		&list_fulls($host,undef,undef,"last");			
+		print "Data for last full:\n";
+		&list_fulls($host,undef,undef,"last_full");
+		print "Backup Success Rate (since last full):\n";
+		$epoch_start_date = $epoch_lastfulldate;
+		my $successRate = sprintf("%.2f", &host_generic($host, "success_rate",undef,$epoch_start_date,undef, $no_fulls) * 100);
+		print "\t\t$successRate% success\n\n";
+	}
+	# Getting data from our last full
+	if(defined $stat_last_full)
+	{
+		&list_fulls($host,undef,undef,"last_full");
+	}
+	# Getting data from all fulls
+	if(defined $stat_list_fulls)
+	{
+		&list_fulls($host,$epoch_start_date,$epoch_end_date,"all");
+	}
+	# Getting data from last backup
+	if(defined $stat_last)
+	{
+		&list_fulls($host,undef,undef,"last");			
+	}
+	# Getting our host successrate
+	if(defined $stat_successrate)
+	{
+		my $successRate = sprintf("%.2f", &host_generic($host, "success_rate", $epoch_date,$epoch_start_date, $epoch_end_date, $no_fulls) * 100);
+		print "$successRate% success\n";
+	}
+	# If we are getting a host based report...
+	if(defined $report)
+	{
+		# Some basic formatting
+		print "\n\t:::Report for $host\:::";
+		&print_date_header($date, undef, $start_date, $end_date);
+		print "\n";
+
+		if(not defined $epoch_start_date){
+			## 
+			# Hmm, I have to check the need for this 
+			## 
+			$epoch_start_date = $epoch_lastfulldate;
+		}
+		# Since we are not dealing with a single date we can get the growth rates
+        	if(not defined $epoch_date)
+        	{
+			my $host_count_expansion_rate = &get_host_count_expansion_rate($host, $epoch_date,$epoch_start_date, $epoch_end_date, $no_fulls);
+			print "File count growth rate (%):\t\t\t$host_count_expansion_rate\n";
+			my $host_size_expansion_rate = &get_host_size_expansion_rate($host, $epoch_date,$epoch_start_date, $epoch_end_date, $no_fulls);
+			print "File size growth rate (%):\t\t\t$host_size_expansion_rate\n";
+		}
+		# Backup success rate 
+		print "\nBackup Success Rate:";
+		my $successRate = sprintf("%.2f", &host_generic($host, "success_rate",$epoch_date,$epoch_start_date,$epoch_end_date,$no_fulls) * 100);
+		print "\t\t\t\t$successRate% success\n\n";
+
+		# Report everything about files
+		&report_files($host,$epoch_date,$epoch_start_date,$epoch_end_date,$no_fulls);
+
+		print "\t:::Most Recent Report Data\:::\n\n";
+                my $since_last = &list_fulls($host,undef,undef,"days_since_last");
+                print "Last Backup Occurred $since_last ago\n";
+
+		print "\nData for last successful backup:\n";
+		&list_fulls($host,undef,undef,"last");			
+		print "Data for last full:\n";
+		&list_fulls($host,undef,undef,"last_full");
+
+	}
+}
+
+#######################################################################################
+# END HOST MAIN
+#######################################################################################
+
+#######################################################################################
+# START GENERAL FUNCTIONS
+#######################################################################################
+
+# Prints out data value in Nagios performance date friendly format.
+# If nagiosW and/or nagiosC is provided then exists with the correct
+# error codes to trigger the appropriate Nagios response.
+# 
+# Expects:
+# 	nagiosW (warning) or nagiosC (critical) values
+# 	nagiosOutPut1 - the descriptive left side of the output
+# 	nagiosOutPut2 - the descriptive right side of the output
+# Returns:
+#	Prints performance data directly from the function
+#	and exists with proper error code
+#
+sub nagios_output{
+
+	my $nagiosW = $_[0];
+	my $nagiosC = $_[1];
+
+	my $nagiosOutPut1 = $_[2];
+	my $nagiosOutPut2 = $_[3];
+	my $nagiosOutPutValue = $_[4];
+
+	# Working through cases...
+	if(not defined $nagiosW and not defined $nagiosC){
+		print "$nagiosOutPut1 Ok: $nagiosOutPutValue|$nagiosOutPut2=$nagiosOutPutValue\n";
+		exit 0;
+	}
+
+	if(defined $nagiosW and not defined $nagiosC){
+		if($nagiosOutPutValue < $nagiosW){
+			print "$nagiosOutPut1 Ok: $nagiosOutPutValue|$nagiosOutPut2=$nagiosOutPutValue\n";
+			exit 0;
+		}
+		elsif($nagiosOutPutValue > $nagiosW)
+		{
+			print "$nagiosOutPut1 Warning: $nagiosOutPutValue|$nagiosOutPut2=$nagiosOutPutValue\n";
+			exit 1;
+		}
+		else
+		{
+			exit 3;
+		}
+		
+	}
+
+	if(not defined $nagiosW and defined $nagiosC){
+		if($nagiosOutPutValue < $nagiosC){
+                        print "$nagiosOutPut1 Ok: $nagiosOutPutValue|$nagiosOutPut2=$nagiosOutPutValue\n";
+                        exit 0;
+                }
+                elsif($nagiosOutPutValue > $nagiosC)
+                {
+                        print "$nagiosOutPut1 Critical: $nagiosOutPutValue|$nagiosOutPut2=$nagiosOutPutValue\n";
+                        exit 2;
+                }
+                else
+                {
+                        exit 3;
+                }
+
+	}
+
+	if(defined $nagiosW and defined $nagiosC){
+		if($nagiosOutPutValue > $nagiosW){
+                        print "$nagiosOutPut1 Ok: $nagiosOutPutValue|$nagiosOutPut2=$nagiosOutPutValue\n";
+                        exit 0;
+                }
+                elsif($nagiosOutPutValue > $nagiosW and $nagiosOutPutValue < $nagiosC)
+                {
+                        print "$nagiosOutPut1 Warning: $nagiosOutPutValue|$nagiosOutPut2=$nagiosOutPutValue\n";
+                        exit 1;
+                }
+                elsif($nagiosOutPutValue > $nagiosC)
+                {
+                        print "$nagiosOutPut1 Critical: $nagiosOutPutValue|$nagiosOutPut2=$nagiosOutPutValue\n";
+                        exit 2;
+                }
+                else
+                {
+                        exit 3;
+                }
+
+	}
+}
+
+# Converts epochtime to month/day/year
+# Expects:
+#	$ep_time = epochtime
+# Returns:
+#	A good time
+#
+sub mytime{
+        my $ep_time = $_[0];
+        my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime($ep_time);
+        $year = $year + 1900;
+        $mon = $mon + 1;
+        my $goodtime = "$mon/$mday/$year";
+        return ($goodtime)
+}
+
+# Basic function to print a header
+# Expects:
+# 	Some combination of an exact date, the last full, start of a range,
+#	end of a range, and whether fulls are included in reports
+# Returns:
+#	Prints header directly from the function
+#
+sub print_date_header{
+
+	# I ought to get some ASCII art in here...
+
+	# An exact date
+        my $subdate = $_[0];
+	# Our last full date
+        my $sublastfulldate = $_[1];
+	# Start of the range
+        my $substart_date = $_[2];
+	# End of the range
+        my $subend_date = $_[3];
+	# We are not interested in numbers with fulls
+        my $sub_no_fulls = $_[4];
+
+	# Print our basic header based on the case
+	if(defined $subdate and not defined $sub_no_fulls){
+		print "\n\t:::Data for the Full day of $subdate\:::\n";
+	}
+	if(defined $subdate and defined $sub_no_fulls){
+		print "\n\t:::Data for the Full day of $subdate (not including fulls):::\n";
+	}
+	if(defined $substart_date and defined $subend_date and not defined $sub_no_fulls){
+		print "\n\t:::Data for the Period $substart_date to $subend_date\:::\n";
+	}
+	if(defined $substart_date and defined $subend_date and defined $sub_no_fulls){
+		print "\n\t:::Data for the Period $substart_date to $subend_date (not including fulls)\:::\n";
+	}
+	if(defined $substart_date and not defined $subend_date and not defined $sub_no_fulls){
+		print "\n\t:::Data for the Period $substart_date to NOW\:::\n";
+	}
+	if(defined $substart_date and not defined $subend_date and defined $sub_no_fulls){
+		print "\n\t:::Data for the Period $substart_date to NOW (not including fulls)\:::\n";
+	}
+
+}
+
+# Basic help info
+# Expects:
+#	Nothing
+# Returns:
+#	Prints usage directly from function and then exists
+#
+sub print_usage{
+
+	print "\nUsage:\t$0 [date] [query target] [query type] [extra]
+
+		Where:\t[date] is one or more of: 	
+		--date=\t(is the 24 hours within given date)
+		--sdate=\t Dates in month/day/year format
+		--edate=\t Dates in month/day/year format
+		--sdate_days=\t Start in terms of \"days\" ago
+		--edate_days=\t End in terms of \"days\" ago
+		--since_full\t(for host only)
+		Date is optional for the host query target.  If there 
+		is no date specified status will be based on data since
+		the beginning of TODAY.
+
+		Where:\t[query target] is one of:
+		--group=\t Name of catalogue, default is ECI
+		--host=\t
+
+		Where:\t[query type] is one or more of:
+		--report\t
+		--failures=days	Displays a listing of hosts that have failed for 
+			'days' number or greater days.
+		--status - Provides stat_last, stat_last_full, and stat_successrate
+		  --stat_last_full\t(for host only)
+		  --stat_list_fulls\t(for host only)
+		  --stat_last\t(for host only) 
+       		  --stat_successrate\t A percentage of successful backups done specified
+			time frame.  Supports Nagios output.
+ 		--expansion\t(default all below)
+       		  --excount\t Growth rate of the file count for date range specified
+			Supports Nagios output
+       		  --exsize\t Growth rate of the file size for date range specified
+			Supports Nagios output
+ 		--files\t(default all below)
+		  --no_fulls\t Don't include fulls in calculations for options below
+       		  --fcount\t File count. Supports Nagios output
+       		  --fsize\t File size.  Supports Nagios output
+       		  --faverage_count\t Average file count across backups
+       		  --faverage_size\t Average file size across backups
+       		  --frank\t(host only, both count and size, for ranking in group)
+       		  --frank_count\t(host only, for ranking in group)
+       		  --frank_size\t(host only, for ranking in group)
+       		  --fpercent_count\t(host only, percentage of group total)
+       		  --fpercent_size\t(host only, percentage of group total)
+		
+		Where:\t[extra] is one of:
+		--debug\t
+		--nagios 	Spits out data in Nagios performance data friendly format
+		--nagiosW 	Nagios warn level, reports in performance data friendly format
+		--nagiosC 	Nagios critical level, reports in performance data friendly format
+
+	  \n";
+	exit;
+}
+
+# Converts some number of seconds to hours, minutes, and seconds
+# Expects:
+#       $elapsed_time = epochtime
+# Returns:
+#       Converted time frame
+#
+sub time_converter
+{
+	my $elapsed_time = $_[0];
+	my $converted_time;
+
+	my $elapsed_days =  int($elapsed_time/(24*60*60));
+	my $elapsed_hours =  ($elapsed_time/(60*60))%24;
+	my $elapsed_minutes = ($elapsed_time/60)%60;
+	my $elapsed_seconds = $elapsed_time%60;
+
+	if ($elapsed_days ne "0"){$converted_time = "$elapsed_days days "}
+	if ($elapsed_hours ne "0"){$converted_time = $converted_time."$elapsed_hours hours "}
+	if ($elapsed_minutes ne "0"){$converted_time = $converted_time."$elapsed_minutes minutes "}
+	if ($elapsed_seconds ne "0"){$converted_time = $converted_time."$elapsed_seconds seconds"}
+	return ($converted_time);
+}
+
+# Converts bytes to MB or GB and rounds to nearest hundreth
+# Expects:
+#       $bytes = bytes
+# Returns:
+#     	Converted string  
+#
+sub byte_converter
+{
+	my $bytes = $_[0];
+
+	# GB
+       	my $size = sprintf("%.2f", $bytes / 1073741824);
+
+	if ($size eq "0.00")
+	{
+       		$size = sprintf("%.2f", $bytes / 1048576);
+		if($size gt 0)
+		{
+			$size = $size." MB";
+		}	
+	}
+	else 
+	{
+		$size = $size." GB";
+	}
+	
+	return $size;
+}
+
+# A function to give you the number of failed hosts for a given date
+# Expects:
+#       Epochtime date
+# Returns:
+#      	Number of failed hosts on a given date 
+#
+sub host_failure_count
+{
+
+	my $date = $_[0];
+	my $host_fail_count;
+
+	my $query = "select count(*) from Job where Name!='RestoreFiles' and JobStatus!='T' and JobTDate > ? and JobTDate < ?";
+        my $sth = $dbh->prepare($query);
+        $sth->execute($date, $date+86400) or die $dbh->errstr;
+        while (my @data = $sth->fetchrow_array())
+        {
+                $host_fail_count = $data[0];
+        }
+
+	return ($host_fail_count);
+}
+
+# A function to give you the number of successful hosts for a given date
+# Expects:
+#       Epochtime date
+# Returns:
+#       Number of successful hosts on a given date 
+#       
+sub host_success_count
+{
+
+	my $date = $_[0];
+	my $host_success_count;
+
+	my $query = "select count(*) from Job where Name!='RestoreFiles' and JobStatus='T' and JobTDate > ? and JobTDate < ?";
+        my $sth = $dbh->prepare($query);
+        $sth->execute($date, $date+86400) or die $dbh->errstr;
+        while (my @data = $sth->fetchrow_array())
+        {
+                $host_success_count = $data[0];
+        }
+
+	return ($host_success_count);
+}
+
+#######################################################################################
+# END GENERAL FUNCTIONS
+#######################################################################################
+
+#######################################################################################
+# START GROWTH FUNCTIONS
+#######################################################################################
+
+# These are the expansion query types.  These measure growth rates based on:
+#       Percent change = ((Vpresent-Vpast)/Vpast*100) / unit of time
+#       http://www.ehow.com/how_4532706_calculate-growth-rate-percent-change.html
+# This may be useful for capacity planning
+
+# Gets the file count growth rate by host or group
+# Expects:
+#      	hostname, exact date or date range, optional whether or not to include fulls
+#	in calculation.  If _ALL_ is provided as the hostname then the total rate
+#	for the group is calculated
+# Returns:
+#        Growth rate for given time period expressed as a percentage
+#       
+sub get_host_count_expansion_rate{
+
+	my $subhost = $_[0];
+	my $subdate = $_[1];
+	my $substart_date = $_[2];
+	my $subend_date = $_[3];
+	my $sub_no_fulls = $_[4];
+	
+	#
+	# We need to define total files at start and end of period
+	#
+
+	if(defined $DEBUG)
+	{
+		print "sub get_host_count_expansion_rate: EXcount Start Date - $substart_date :: End Date - $subend_date \n";	
+	}	
+
+	if($subhost eq "_ALL_")
+	{
+		# We are getting the total count at the start so set beginning of range to 0 and end to $substart_date
+		# Get our counts at the start
+		my $sub_file_count_start = &host_generic(undef,"group_total_fcount",undef,"0",$substart_date,$sub_no_fulls);
+		if(not defined $sub_file_count_start or $sub_file_count_start eq "0")
+		{
+			print "You picked a start date for which there is not data.  Pick a later date.\n";	
+			exit;
+		}
+		# Get our counts at the end
+		my $sub_file_count_end = &host_generic(undef,"group_total_fcount",undef,"0",$subend_date,$sub_no_fulls);
+		if(defined $DEBUG){print "sub get_host_count_expansion_rate: vpast =    $sub_file_count_start \n";}
+		if(defined $DEBUG){print "sub get_host_count_expansion_rate: vpresent = $sub_file_count_end \n";}
+		# Do the math
+		my $expansion_rate = sprintf("%.2f", ($sub_file_count_end - $sub_file_count_start) / ($sub_file_count_start) * 100);
+		return($expansion_rate);
+	}
+	
+	# Do the above but for a specific host	
+	my $sub_file_count_start = &host_generic($subhost,"fcount",undef,"0",$substart_date,$sub_no_fulls);
+	if(not defined $sub_file_count_start or $sub_file_count_start eq "0")
+	{
+		print "You picked a start date for which there is not data.  Pick a later date.\n";	
+		exit;
+	}
+
+	my $sub_file_count_end = &host_generic($subhost,"fcount",undef,"0",$subend_date,$sub_no_fulls);
+	my $expansion_rate = sprintf("%.2f", ($sub_file_count_end - $sub_file_count_start) / ($sub_file_count_start) * 100);
+
+	return($expansion_rate);
+}
+
+# Gets the file size growth rate by host or group
+# Expects:
+#       hostname, exact date or date range, optional whether or not to include fulls
+#       in calculation.  If _ALL_ is provided as the hostname then the total rate
+#       for the group is calculated
+# Returns:
+#        Growth rate for given time period expressed as a percentage
+#       
+sub get_host_size_expansion_rate{
+
+	my $subhost = $_[0];
+	my $subdate = $_[1];
+	my $substart_date = $_[2];
+	my $subend_date = $_[3];
+	my $sub_no_fulls = $_[4];
+	
+	if($subhost eq "_ALL_")
+	{
+		my $sub_file_size_start = &host_generic(undef,"group_total_fsize",undef,"0",$substart_date,$sub_no_fulls);
+		if(not defined $sub_file_size_start or $sub_file_size_start eq "0")
+		{
+			print "You picked a start date for which there is not data.  Pick a later date.\n";	
+			exit;
+		}
+		my $sub_file_size_end = &host_generic(undef,"group_total_fsize",undef,"0",$subend_date,$sub_no_fulls);
+		my $expansion_rate = sprintf("%.2f", ($sub_file_size_end - $sub_file_size_start) / ($sub_file_size_start) * 100);
+		if(defined $DEBUG){print "sub get_host_size_expansion_rate: vpast =    $sub_file_size_start \n";}
+		if(defined $DEBUG){print "sub get_host_size_expansion_rate: vpresent = $sub_file_size_end \n";}
+		return($expansion_rate);
+	}
+
+	my $sub_file_size_start = &host_generic($subhost,"fsize",undef,"0",$substart_date,$sub_no_fulls);
+	if(not defined $sub_file_size_start or $sub_file_size_start eq "0")
+	{
+		print "You picked a start date for which there is not data.  Pick a later date.\n";	
+		exit;
+	}
+
+	my $sub_file_size_end = &host_generic($subhost,"fsize",undef,"0",$subend_date,$sub_no_fulls);
+	my $expansion_rate = sprintf("%.2f", ($sub_file_size_end - $sub_file_size_start) / ($sub_file_size_start) * 100);
+
+	return($expansion_rate);
+}
+
+#######################################################################################
+# END GROWTH FUNCTIONS
+#######################################################################################
+
+#######################################################################################
+# START HOST FUNCTIONS
+#######################################################################################
+
+# Get last full date of a host
+# Expects:
+# 	The name of a host
+# Returns:
+#	The last full epoch date
+#
+sub host_lastfull{
+	
+	# Our host
+	my $subhost = $_[0];
+	my $sublastfulldate;
+
+	my $sth;
+
+        # Get last full date
+        $sth = $dbh->prepare('select JobTDate from Job where Name=? and JobStatus="T" and Level="F" order by JobID desc limit 1');
+        $sth->execute($subhost) or die $dbh->errstr;
+        while (my @data = $sth->fetchrow_array())
+        {
+                $sublastfulldate = $data[0];
+        }
+	return ($sublastfulldate);
+}
+
+# Get the oldest date of backup for host
+# Expects:
+# 	The name of a host
+# Returns:
+#	The epoch date of oldest backup
+#
+sub host_oldest_backup{
+	
+	# Our host
+	my $subhost = $_[0];
+
+	# DB handle
+	my $oldest_backup;
+	my $sth;
+
+        # Get last full date
+        $sth = $dbh->prepare('select JobTDate from Job where Name=? and JobStatus="T" order by JobID asc limit 1');
+        $sth->execute($subhost) or die $dbh->errstr;
+        while (my @data = $sth->fetchrow_array())
+        {
+                $oldest_backup = $data[0];
+        }
+	return ($oldest_backup);
+}
+
+# Get list of hosts
+# Expects:
+# 	Nothing (but somehow manages to keep its cheer...)
+# Returns:
+#	Sorted array of hostnames
+#
+sub list_hosts{
+	
+	# DB handle and host array
+	my $sth;
+	my @sub_hosts;
+
+	# Get our sorted hosts
+	$sth = $dbh->prepare('select Distinct Name from Job where Name!="BackupCatalog" and Name!="RestoreFiles" order by Name asc');
+        $sth->execute() or die $dbh->errstr;
+        while (my @data = $sth->fetchrow_array())
+        {
+                push (@sub_hosts, $data[0]);
+	}	
+	return(@sub_hosts);
+}
+
+# Reports on files for a host.  A wrapper function that
+# calls other functions
+# Expects:
+# 	hostname, exact date or date range, and optionally whether to include fulls
+# Returns:
+#	Directly prints output from a bunch of other functions
+#
+sub report_files{
+
+	# Our host
+	my $subhost = $_[0];
+	my $epoch_date = $_[1];
+	my $epoch_start_date = $_[2];
+	my $epoch_end_date = $_[3];
+	my $no_fulls = $_[4];
+
+	# We need to generate the lists of hosts to pass to the ranking functions
+	my @hosts = &list_hosts();
+
+	# Getting file count
+	my $F_count = &host_generic($host,"fcount",$epoch_date,$epoch_start_date, $epoch_end_date, $no_fulls);
+	# Getting file size
+	my $F_size = &host_generic($host,"fsize",$epoch_date,$epoch_start_date,$epoch_end_date,$no_fulls);
+	$F_size = &byte_converter($F_size);
+	# Getting average file count
+	my $Fave_count = &host_generic($host, "faverage_count",$epoch_date,$epoch_start_date, $epoch_end_date, $no_fulls);
+	# Getting average file size
+	my $Fave_size = &host_generic($host, "faverage_size", $epoch_date,$epoch_start_date, $epoch_end_date, $no_fulls);
+	$Fave_size = &byte_converter($Fave_size);
+	# Getting file count rank amongst @hosts
+	my $FCrank = &host_frank_count($host, \@hosts, $epoch_date,$epoch_start_date, $epoch_end_date, $no_fulls);
+	# Getting file size rank amongst @hosts
+	my $FSrank = &host_frank_size($host, \@hosts, $epoch_date,$epoch_start_date, $epoch_end_date, $no_fulls);
+	# Getting file count percentage amongst group
+	my $countPercentage = &host_fpercent_count($host,$epoch_date,$epoch_start_date, $epoch_end_date, $no_fulls);
+	# Getting file size percentage amongst group
+	my $sizePercentage = &host_fpercent_size($host,$epoch_date,$epoch_start_date, $epoch_end_date, $no_fulls);
+
+	# Printing it out
+	print "Total File count:\t\t\t\t$F_count files\n";
+	print "Total File size:\t\t\t\t$F_size \n";
+	print "\n";
+	if (not defined $epoch_date)
+	{
+		print "Average backup file count:\t\t\t$Fave_count files\n";
+		print "Average backup file size:\t\t\t$Fave_size\n";
+		print "\n";
+	}
+	print "File count rank:\t\t\t\t$FCrank out of ".scalar(@hosts)." hosts\n";
+	print "File size rank:\t\t\t\t\t$FSrank out of ".scalar(@hosts)." hosts\n";
+	print "\n";
+	print "File count usage:\t\t\t\t$countPercentage\% of group total\n";
+	print "File size usage:\t\t\t\t$sizePercentage\% of group total\n";
+	print "\n";
+}
+
+#
+# Do get some data for a host or group
+#
+# Expects:
+# 	hostname
+# 	task - one of 	
+#	fcount
+#	fsize
+#	faverage_count
+#	faverage_size
+#	group_total_fsize
+#	group_total_count
+#	group_faverage_size
+#	group_faverage_count
+#	success_rate
+#	group_success_rate
+#	
+#	Exact date, date range, and optionally whether to include fulls	
+#	
+#	Case 1: exact date or  
+#	Case 2: last full date or
+#  	Case 3: range start date or
+#	Case 4: range start and end date or
+# 	Case 5: range end date, 
+#	
+#
+# Returns:
+#	Values based on the task provided
+#
+sub host_generic {
+
+	# Our sub variables
+	my $host = $_[0];
+	my $task = $_[1];
+	my $date = $_[2];
+	my $start_date = $_[3];
+	my $end_date = $_[4];
+	my $no_fulls = $_[5];
+
+	# Our DB handles and return value
+	my $total;
+	my $sth;
+
+	# Be verbose if debug is on
+	if(defined $DEBUG)
+	{
+		print "sub host_generic: $task Start Date - $start_date :: End Date - $end_date \n";	
+	}	
+
+	# Set up the query
+	# Do this only if we don't have an exact date or don't have an end date to a range, or we do have a $lastfulldate
+	# Case 2, 3
+
+	unless(defined $date or defined $end_date){
+		if(defined $no_fulls){
+			# If we are not including fulls 
+			if($task eq "fcount"){
+				$sth = $dbh->prepare('select sum(JobFiles) from Job where Name=? and Level!="F" and JobTDate >?');
+			}
+			elsif($task eq "group_total_fcount"){
+				$sth = $dbh->prepare('select sum(JobFiles) from Job where Level!="F" and JobTDate >?');
+			}
+			elsif($task eq "fsize"){
+				$sth = $dbh->prepare('select sum(Jobbytes) from Job where name=? and Level!="F" and Jobtdate >?');
+			}
+			elsif($task eq "group_total_fsize"){
+				$sth = $dbh->prepare('select sum(Jobbytes) from Job where Level!="F" and Jobtdate >?');
+			}
+			elsif($task eq "faverage_count"){
+				$sth = $dbh->prepare('select round(avg(JobFiles)) from Job where Name=? and Level!="F" and JobTDate >=?');
+			}
+			elsif($task eq "group_faverage_count"){
+				$sth = $dbh->prepare('select round(avg(JobFiles)) from Job where Level!="F" and JobTDate >=?');
+			}
+			elsif($task eq "faverage_size"){
+				$sth = $dbh->prepare('select round(avg(Jobbytes)) from Job where Name=? and Level!="F" and Jobtdate >=?');	
+			}
+			elsif($task eq "group_faverage_size"){
+				$sth = $dbh->prepare('select round(avg(Jobbytes)) from Job where Level!="F" and Jobtdate >=?');	
+			}
+			elsif($task eq "success_rate"){
+				$sth = $dbh->prepare('select (select count(*) from Job where Name=? and JobStatus="T" and Level!="F" and Jobtdate >=?)/(select count(*) from Job where Name=? and Level!="F" and Jobtdate >=?)');	
+			}
+			elsif($task eq "group_success_rate"){
+				$sth = $dbh->prepare('select (select count(*) from Job where Name!="RestoreFiles" and JobStatus="T" and Level!="F" and Jobtdate >=?)/(select count(*) from Job where Name!="RestoreFiles" Level!="F" and Jobtdate >=?)');	
+			}
+		}else{
+			# If we are including fulls 
+			if($task eq "fcount"){
+				$sth = $dbh->prepare('select sum(JobFiles) from Job where Name=? and JobTDate >?');
+			}
+			elsif($task eq "group_total_fcount"){
+				$sth = $dbh->prepare('select sum(JobFiles) from Job where JobTDate >?');
+			}
+			elsif($task eq "fsize"){
+				$sth = $dbh->prepare('select sum(Jobbytes) from Job where name=? and Jobtdate >?');
+			}
+			elsif($task eq "group_total_fsize"){
+				$sth = $dbh->prepare('select sum(Jobbytes) from Job where Jobtdate >?');
+			}
+			elsif($task eq "faverage_count"){
+				$sth = $dbh->prepare('select round(avg(JobFiles)) from Job where Name=? and JobTDate >=?');
+			}
+			elsif($task eq "group_faverage_count"){
+				$sth = $dbh->prepare('select round(avg(JobFiles)) from Job where JobTDate >=?');
+			}
+			elsif($task eq "faverage_size"){
+				$sth = $dbh->prepare('select round(avg(Jobbytes)) from Job where Name=? and Jobtdate >=?');	
+			}
+			elsif($task eq "group_faverage_size"){
+				$sth = $dbh->prepare('select round(avg(Jobbytes)) from Job where Jobtdate >=?');	
+			}
+			elsif($task eq "success_rate"){
+				$sth = $dbh->prepare('select (select count(*) from Job where Name=? and JobStatus="T" and Jobtdate >=?)/(select count(*) from Job where Name=? and Jobtdate >=?)');	
+			}
+			elsif($task eq "group_success_rate"){
+				$sth = $dbh->prepare('select (select count(*) from Job where Name!="RestoreFiles" and JobStatus="T" and Jobtdate >=?)/(select count(*) from Job where Name!="RestoreFiles" and Jobtdate >=?)');	
+			}
+		}
+		if(defined $DEBUG){print "sub host_generic: $host 2,3\n"}
+	# Case 1, 4, 5
+	# This means we have either an exact date, a defined range
+	}else{
+		if(defined $no_fulls){
+			# If we are not including fulls 
+			if($task eq "fcount"){
+				$sth = $dbh->prepare('select sum(JobFiles) from Job where Name=? and Level!="F" and JobTDate >=? and JobTDate <=?');
+			}
+			elsif($task eq "group_total_fcount"){
+				$sth = $dbh->prepare('select sum(JobFiles) from Job where Level!="F" and JobTDate >=? and JobTDate <=?');
+			}
+			elsif($task eq "fsize"){
+				$sth = $dbh->prepare('select sum(Jobbytes) from Job where name=? and Level!="F" and Jobtdate >=? and Jobtdate <=?');
+			}
+			elsif($task eq "group_total_fsize"){
+				$sth = $dbh->prepare('select sum(Jobbytes) from Job where Level!="F" and Jobtdate >=? and Jobtdate <=?');
+			}
+			elsif($task eq "faverage_count"){
+				$sth = $dbh->prepare('select round(avg(JobFiles)) from Job where Name=? and Level!="F" and JobTDate >=? and JobTDate <=?');	
+			}
+			elsif($task eq "group_faverage_count"){
+				$sth = $dbh->prepare('select round(avg(JobFiles)) from Job where Level!="F" and JobTDate >=? and JobTDate <=?');	
+			}
+			elsif($task eq "faverage_size"){
+				$sth = $dbh->prepare('select round(avg(Jobbytes)) from Job where Name=? and Level!="F" and Jobtdate >=? and JobTDate <=?');
+			} 
+			elsif($task eq "group_faverage_size"){
+				$sth = $dbh->prepare('select round(avg(Jobbytes)) from Job where Level!="F" and Jobtdate >=? and JobTDate <=?');
+			} 
+			elsif($task eq "success_rate"){
+				$sth = $dbh->prepare('select (select count(*) from Job where Name=? and JobStatus="T" and Level!="F" and Jobtdate >=? and JobTDate <=?)/(select count(*) from Job where Name=? and Level!="F" and Jobtdate >=? and JobTDate <=?)');	
+			}
+			elsif($task eq "group_success_rate"){
+				$sth = $dbh->prepare('select (select count(*) from Job where Name!="RestoreFiles" and JobStatus="T" and Level!="F" and Jobtdate >=? and JobTDate <=?)/(select count(*) from Job where Name!="RestoreFiles" and  Level!="F" and Jobtdate >=? and JobTDate <=?)');	
+			}
+		}else{
+			# If we are including fulls 
+			if($task eq "fcount"){
+				$sth = $dbh->prepare('select sum(JobFiles) from Job where Name=? and JobTDate >=? and JobTDate <=?');
+			}
+			elsif($task eq "group_total_fcount"){
+				$sth = $dbh->prepare('select sum(JobFiles) from Job where JobTDate >=? and JobTDate <=?');
+			}
+			elsif($task eq "fsize"){
+				$sth = $dbh->prepare('select sum(Jobbytes) from Job where name=? and Jobtdate >=? and Jobtdate <=?');
+			}
+			elsif($task eq "group_total_fsize"){
+				$sth = $dbh->prepare('select sum(Jobbytes) from Job where Jobtdate >=? and Jobtdate <=?');
+			}
+			elsif($task eq "faverage_count"){
+				$sth = $dbh->prepare('select round(avg(JobFiles)) from Job where Name=? and JobTDate >=? and JobTDate <=?');	
+			}
+			elsif($task eq "group_faverage_count"){
+				$sth = $dbh->prepare('select round(avg(JobFiles)) from Job where JobTDate >=? and JobTDate <=?');	
+			}
+			elsif($task eq "faverage_size"){
+				$sth = $dbh->prepare('select round(avg(Jobbytes)) from Job where Name=? and Jobtdate >=? and JobTDate <=?');	
+			}
+			elsif($task eq "group_faverage_size"){
+				$sth = $dbh->prepare('select round(avg(Jobbytes)) from Job where Jobtdate >=? and JobTDate <=?');	
+			}
+			elsif($task eq "success_rate"){
+				$sth = $dbh->prepare('select (select count(*) from Job where Name=? and JobStatus="T" and Jobtdate >=? and JobTDate <=?)/(select count(*) from Job where Name=? and Jobtdate >=? and JobTDate <=?)');	
+			}
+			elsif($task eq "group_success_rate"){
+				$sth = $dbh->prepare('select (select count(*) from Job where Name!="RestoreFiles" and JobStatus="T" and Jobtdate >=? and JobTDate <=?)/(select count(*) from Job where Name!="RestoreFiles" and Jobtdate >=? and JobTDate <=?)');	
+			}
+		}
+		if(defined $DEBUG){print "sub host_generic: $host 1,4,5\n"}
+	}	
+
+	# Execute the proper query	
+
+	# Case 1
+	# Exact date (actually this a one day range so add a day's worth of seconds to it)
+	if(defined $date){
+		if(defined $host and $task ne "success_rate")
+		{
+                	$sth->execute($host,$date,$date+86400) or die $dbh->errstr;
+			if(defined $DEBUG){print "sub host_generic: $host 1\n"}
+		}elsif(($task eq "group_total_fcount") or ($task eq "group_total_fsize") or ($task eq "group_faverage_count") or ($task eq "group_faverage_size")) {
+                	$sth->execute($date,$date+86400) or die $dbh->errstr;
+		}elsif($task eq "success_rate"){
+                	$sth->execute($host,$date,$date+86400,$host,$date,$date+86400) or die $dbh->errstr;
+		}elsif($task eq "group_success_rate"){
+                	$sth->execute($date,$date+86400,$date,$date+86400) or die $dbh->errstr;
+		}
+        }
+
+	# Case 3
+	# range start date
+	elsif(defined $start_date and not defined $end_date){
+		if(defined $host and $task ne "success_rate")
+		{
+			$sth->execute($host,$start_date) or die $dbh->errstr;
+			if(defined $DEBUG){print "sub host_generic: $host 3\n"}
+		}elsif(($task eq "group_total_fcount") or ($task eq "group_total_fsize") or ($task eq "group_faverage_count")or ($task eq "group_faverage_size")) {
+			$sth->execute($start_date) or die $dbh->errstr;
+		}elsif($task eq "success_rate"){
+                        $sth->execute($host,$start_date,$host,$start_date) or die $dbh->errstr;
+		}elsif($task eq "group_success_rate"){
+                        $sth->execute($start_date,$start_date) or die $dbh->errstr;
+                }
+	}
+	# Case 4
+	# range start and end date
+	elsif(defined $start_date and defined $end_date){
+		if(defined $host and $task ne "success_rate")
+		{
+			$sth->execute($host,$start_date,$end_date) or die $dbh->errstr;
+			if(defined $DEBUG){print "sub host_generic: $host 4\n"}
+		}elsif(($task eq "group_total_fcount") or ($task eq "group_total_fsize") or ($task eq "group_faverage_count")or ($task eq "group_faverage_size")) {
+			$sth->execute($start_date,$end_date) or die $dbh->errstr;
+		}elsif($task eq "success_rate"){
+                        $sth->execute($host,$start_date,$end_date,$host,$start_date,$end_date) or die $dbh->errstr;
+		}elsif($task eq "group_success_rate"){
+                        $sth->execute($start_date,$end_date,$start_date,$end_date) or die $dbh->errstr;
+                }
+	}
+	
+	# Get the data
+	while (my @data = $sth->fetchrow_array()) 
+	{
+		$total = $data[0];
+	}
+
+	# Return the data
+	return($total);
+}
+
+#
+# List backup failures after a certain number of days for hosts
+# Expects:
+#    	Number of days that if a host hasn't backed up, report 
+# Returns:
+#       Directly prints output 
+#
+sub list_failures{
+
+	my $days = $_[0];
+	my $epoch_days = $days * 86400;
+	my $host;
+	
+	my $query = "select distinct Name,JobTdate from Job where Name!='RestoreFiles' and JobStatus!='T' and JobTdate >= (unix_timestamp(now()) - ? ) and Name not in (select  Name from Job where JobStatus='T' and JobTdate >= (unix_timestamp(now()) - ? )) group by Name";
+	my $sth = $dbh->prepare($query);	
+	$sth->execute($epoch_days, $epoch_days) or die $dbh->errstr;
+	
+	while (my @data = $sth->fetchrow_array())
+	{
+		$host = $data[0];
+		my $since_last = &list_fulls($host,undef,undef,"days_since_last");
+		if ($since_last eq "0")
+		{
+			print "$host (never backed up)\n";
+		}
+		else{
+			print "$host (last backed up $since_last ago)\n";
+		}
+	}
+	
+}
+
+# Reports on lenght of time for each host
+# Expects:
+#	Nothing
+# Returns:
+#       Directly prints output 
+#
+sub print_hosts_since_backups{
+
+	my $since_last;
+	my %host_hash;
+	my @hosts = &list_hosts;
+	my $key;
+	my $time;
+	my $i;
+	my $idot;
+	
+	print "\n\t:::Time Since Last Backup for Each Host:::\n\n";
+
+	foreach(@hosts){
+		$since_last = &list_fulls($_,undef,undef,"seconds_since_last");
+		$host_hash{$_} = $since_last ;
+	}
+
+	$~ = "OUT1";
+	foreach $key(sort { $host_hash{$b} <=> $host_hash{$a} } keys %host_hash ){
+		$i++;
+		$idot = $i.".";
+		$time = &time_converter($host_hash{$key});
+		if ($time eq undef){$time = "Never"}
+		write;
+	}
+
+format OUT1 =
+@<< @<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<< @<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+$idot, $key, $time
+.
+
+}
+
+# Reports on host file size rankings
+# Expects:
+#	Exact date, date range, optionally whether to include fulls
+# Returns:
+#       Directly prints output 
+#
+sub print_hosts_FSrank{
+	
+	my @hosts = &list_hosts;
+
+	my $epoch_date = $_[0];
+	my $epoch_start_date = $_[1];
+	my $epoch_end_date = $_[2];
+	my $no_fulls = $_[3];
+
+	my $F_size;
+	my $sizePercentage;
+	my $i;
+	my $idot;
+
+	my @FSrankHosts = &host_frank_size("_ALL_", \@hosts, $epoch_date,$epoch_start_date, $epoch_end_date, $no_fulls);
+
+
+	print "\t:::File Size Rankings:::\n\n";
+	$~ = "OUT2";
+	foreach(@FSrankHosts){
+		$i++;
+		$idot = $i.".";
+        	$F_size = &byte_converter(&host_generic($_,"fsize",$epoch_date,$epoch_start_date,$epoch_end_date,$no_fulls)); 
+		$sizePercentage = &host_fpercent_size($_,$epoch_date,$epoch_start_date, $epoch_end_date, $no_fulls);
+		write;
+	}
+
+format OUT2 =
+@<< (@<<<<%) @<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<< @<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+$idot, $sizePercentage, $_, $F_size
+.
+
+}
+
+# Reports on host file count rankings
+# Expects:
+#	Exact date, date range, optionally whether to include fulls
+# Returns:
+#       Directly prints output 
+#
+sub print_hosts_FCrank{
+	
+	my @hosts = &list_hosts;
+
+	my $epoch_date = $_[0];
+	my $epoch_start_date = $_[1];
+	my $epoch_end_date = $_[2];
+	my $no_fulls = $_[3];
+
+	my $F_count;
+	my $countPercentage;
+	my $i;
+	my $idot;
+
+	my @FCrankHosts = &host_frank_count("_ALL_", \@hosts, $epoch_date,$epoch_start_date, $epoch_end_date, $no_fulls);
+
+	print "\n\t:::File Count Rankings:::\n\n";
+	$~ = "OUT3";
+	foreach(@FCrankHosts){
+		$i++;
+		$idot = $i.".";
+        	$F_count = &host_generic($_,"fcount",$epoch_date,$epoch_start_date,$epoch_end_date,$no_fulls)." Files";
+		if($F_count eq " Files"){$F_count = "0 Files"}
+		$countPercentage = &host_fpercent_count($_,$epoch_date,$epoch_start_date, $epoch_end_date, $no_fulls);
+		write;
+	}
+
+format OUT3 =
+@<< (@<<<<%) @<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<< @<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+$idot, $countPercentage, $_, $F_count
+.
+
+}
+
+# Reports on file count rankings for a host or group
+# Expects:
+#       hostname (can be _ALL_), array of all hosts, exact date or date range, and optionally whether to include fulls
+# Returns:
+#	Ranking of a single host, if _ALL_ is provided as host then an array of ranked hosts
+#
+sub host_frank_count{
+
+	my $sub_host = $_[0];
+	my $sub_hosts = $_[1];
+	my $sub_date = $_[2];
+        my $sublastfulldate = $_[3];
+        my $substart_date = $_[4];
+        my $subend_date = $_[5];
+	my $sub_no_fulls = $_[6];
+	
+	my $i = '';
+	my $subrank = '';
+	my $sub_file_count;
+	my %sub_host_hash;
+	my @sub_hosts;
+
+
+	foreach(@$sub_hosts){
+		$sub_file_count = &host_generic($_,"fcount",$sub_date,$sublastfulldate,$substart_date,$subend_date,$sub_no_fulls);
+		$sub_host_hash{$_} = $sub_file_count ;
+
+	## DEBUG
+	if(defined $DEBUG){	
+		print "sub host_frank_count: $_ sub_file_count is $sub_file_count\n";
+	}
+	## DEBUG
+
+	}
+
+	# Compare with the UFO
+	foreach my $key(sort { $sub_host_hash{$b} <=> $sub_host_hash{$a} } keys %sub_host_hash ){
+		$i++;
+	## DEBUG
+		if(defined $DEBUG){
+			my $string_date = scalar localtime ($sublastfulldate);
+			print "sub host_frank_count: On $string_date Count Value is $sub_host_hash{$key} Key is $key i is $i\n";
+		}
+	## DEBUG
+		if($sub_host eq "_ALL_")
+		{
+                	push (@sub_hosts, $key);
+		}elsif ($key eq $sub_host){
+			$subrank = $i;
+		}
+	}
+	my $total = keys( %sub_host_hash );
+	
+	## DEBUG
+	if(defined $DEBUG){
+		print "sub host_frank_count:Count Rank of $sub_host is $subrank out of $total Start Date - $substart_date End Date - $subend_date\n";
+	}
+	## DEBUG
+
+	if($sub_host eq "_ALL_")
+        {
+		return(@sub_hosts);
+        }else{
+		return($subrank);
+        }
+}
+
+
+
+# Reports on file size rankings for a host or group
+# Expects:
+#       hostname (can be _ALL_), array of all hosts, exact date or date range, and optionally whether to include fulls
+# Returns:
+#	Ranking of a single host, if _ALL_ is provided as host then an array of ranked hosts
+#
+sub host_frank_size{
+
+	my $sub_host = $_[0];
+	my $sub_hosts = $_[1];
+	my $sub_date = $_[2];
+        my $substart_date = $_[3];
+        my $subend_date = $_[4];
+	my $sub_no_fulls = $_[5];
+	
+	my $i = '';
+	my $subrank = '';
+	my $sub_file_count;
+	my %sub_host_hash;
+	my @sub_hosts;
+
+
+	foreach(@$sub_hosts){
+		my $sub_file_size = &host_generic($_,"fsize",$epoch_date,$epoch_start_date,$epoch_end_date,$no_fulls);
+	## DEBUG
+		if(defined $DEBUG){
+		print "sub host_frank_size: $_,$substart_date,$subend_date\n";
+		}
+	## DEBUG
+		$sub_host_hash{$_} = $sub_file_size ;
+	## DEBUG
+	}
+	foreach my $key(sort { $sub_host_hash{$b} <=> $sub_host_hash{$a} } keys %sub_host_hash ){
+		$i++;
+		## DEBUG
+		if(defined $DEBUG){
+			my $string_date = scalar localtime ($substart_date);
+			print "sub host_frank_size: On $string_date Size Value is $sub_host_hash{$key} Key is $key i is $i\n";
+		}
+		## DEBUG
+		if($sub_host eq "_ALL_")
+		{
+                	push (@sub_hosts, $key);
+		}elsif ($key eq $sub_host){
+			$subrank = $i;
+		}
+		## DEBUG
+		if(defined $DEBUG){
+			my $total = keys( %sub_host_hash );
+			print "sub host_frank_size: Size Rank of $sub_host is $subrank out of $total Start Date - $substart_date End Date - $subend_date\n";
+		}
+		## DEBUG
+	}
+	if($sub_host eq "_ALL_")
+        {
+		return(@sub_hosts);
+        }else{
+		return($subrank);
+        }
+}
+
+# Reports on file count percentage of host in group
+# Expects:
+#       hostname, exact date or date range, and optionally whether to include fulls
+# Returns:
+#	Percentage of file count consumed by this host out of the group total
+#
+sub host_fpercent_count{
+
+        my $subhost = $_[0];
+        my $subdate = $_[1];
+        my $substart_date = $_[2];
+        my $subend_date = $_[3];
+	my $sub_no_fulls = $_[4];
+
+        my $subfpercent_files;
+
+	my $group_file_count = &host_generic(undef,"group_total_fcount",$subdate,$substart_date,$subend_date,$sub_no_fulls);
+	my $host_file_count = &host_generic($subhost,"fcount",$subdate,$substart_date,$subend_date,$sub_no_fulls);
+
+	$subfpercent_files =   sprintf("%.2f", ($host_file_count/$group_file_count) * 100);
+	return($subfpercent_files);
+}
+
+
+# Reports on file size percentage of host in group
+# Expects:
+#       hostname, exact date or date range, and optionally whether to include fulls
+# Returns:
+#	Percentage of file size consumed by this host out of the group total
+#
+sub host_fpercent_size{
+
+        my $subhost = $_[0];
+        my $subdate = $_[1];
+        my $substart_date = $_[2];
+        my $subend_date = $_[3];
+        my $sub_no_fulls = $_[4];
+
+        my $subfpercent_files;
+
+	my $total_file_size = &host_generic(undef,"group_total_fsize",$subdate,$substart_date,$subend_date,$sub_no_fulls);
+	my $host_file_size = &host_generic($subhost,"fsize",$subdate,$substart_date,$subend_date,$sub_no_fulls);
+
+	
+	my $subfpercent_size =   sprintf("%.2f", ($host_file_size/$total_file_size) * 100);
+	return($subfpercent_size);
+}
+
+# Lists fulls
+# Expects:
+#       hostname, exact date or date range, and an $option of last_full, all (fulls), last successful backup,
+#	days_since_last (backup), or seconds_since_last (backup)
+# Returns:
+#	Prints directly a number of stats related to what is asked for
+#
+sub list_fulls
+{
+	my $host = $_[0];
+
+	my $epoch_start_date = $_[1];
+	my $epoch_end_date = $_[2];
+	my $option = $_[3];
+
+	my $sth;
+	my $start_time;
+	my $end_time;
+	my $elapsed_time;
+
+	my $time_string;
+
+	my $job_files;
+	my $job_size;
+	my $job_start_epoch;
+	my $job_finish_epoch;
+
+	if (defined $epoch_start_date and not defined $epoch_end_date)
+	{
+        	$sth = $dbh->prepare("select * from Job where Name=? and JobStatus='T' and Level='F' and JobTdate >? order by JobTdate desc");
+        	$sth->execute($host,$epoch_start_date) or die $dbh->errstr;
+	}
+	elsif (defined $epoch_start_date and defined $epoch_end_date)
+	{
+        	$sth = $dbh->prepare("select * from Job where Name=? and JobStatus='T' and Level='F' and JobTdate >? and JobTdate <? order by JobTdate desc");
+        	$sth->execute($host,$epoch_start_date, $epoch_end_date) or die $dbh->errstr;
+	}
+	elsif (not defined $epoch_start_date and defined $epoch_end_date)
+	{
+        	$sth = $dbh->prepare("select * from Job where Name=? and JobStatus='T' and Level='F' and JobTdate <? order by JobTdate desc");
+        	$sth->execute($host,$epoch_end_date) or die $dbh->errstr;
+	}
+
+	if ($option eq "last_full")
+	{
+		# Getting last
+        	$sth = $dbh->prepare("select * from Job where Name=? and JobStatus='T' and Level='F' order by JobTdate desc limit 1");
+        	$sth->execute($host) or die $dbh->errstr;
+	}
+	elsif ($option eq "all")
+	{
+		# Getting last
+        	$sth = $dbh->prepare("select * from Job where Name=? and JobStatus='T' and Level='F' order by JobTdate desc");
+        	$sth->execute($host) or die $dbh->errstr;
+	}
+	elsif ($option eq "last" or $option eq "days_since_last" or $option eq "seconds_since_last")
+	{
+		# Getting last
+        	$sth = $dbh->prepare("select * from Job where Name=? and JobStatus='T' order by JobTdate desc limit 1");
+        	$sth->execute($host) or die $dbh->errstr;
+	}
+
+        while (my @data = $sth->fetchrow_array())
+        {
+		$start_time = $data[8];
+		$end_time = $data[9];
+		$job_start_epoch = str2time($start_time);
+		$job_finish_epoch = $data[11];
+		$job_files = $data[14];
+		$job_size = &byte_converter($data[15]);
+		$elapsed_time = $job_finish_epoch - $job_start_epoch;
+
+		if($option eq "seconds_since_last"){return(time() - $job_finish_epoch)}
+		if($option eq "days_since_last"){return(&time_converter(time() - $job_finish_epoch ))}
+
+		$time_string = &time_converter($elapsed_time);
+
+		if (defined $start_time)
+		{
+			print "Start Date/Time:\t\t\t\t$start_time\n";
+			print "End Date/Time:\t\t\t\t\t$end_time\n";
+			print "Elapsed Time:\t\t\t\t\t$time_string\n";
+			print "Number of Files:\t\t\t\t$job_files\n";
+			print "Size of Backup:\t\t\t\t\t$job_size\n";
+			my $throughPut = sprintf("%.2f", ($data[15] /  1048576) / ($job_finish_epoch - $job_start_epoch));
+			print "Total Job Throughput (MB/s):\t\t\t$throughPut \n";
+			print "\n";
+		}
+		else
+		{
+		print "No full backups on record for $host\n";
+		}
+	}
+}
+
+#######################################################################################
+# END HOST FUNCTIONS
+#######################################################################################
+
+# Done
+$dbh->disconnect;
